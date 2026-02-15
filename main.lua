@@ -1,5 +1,5 @@
 -- An attempt at making the MP experience bearable for once
--- Very early work in progress
+-- Server performance & stability helper
 
 -- Configuration
 local CONFIG = {
@@ -22,37 +22,49 @@ local CONFIG = {
     physics_recovery_step  = 0.04,
 
     perf_history_length    = 5,
+
+    -- Ambient cleanup
+    min_ambientclean_amount     = 25,       -- How big is a small debris?
+    ambientclean_interval_sec   = 5.0,      -- how often to scan
+
+    -- block limits, use the internal name, good luck on that
+    block_limits = {
+        PFB_BombRack = 5
+        -- PFB_RocketPod = 4,
+        -- PFB_FlakCannon = 3,
+        -- etc...
+    },
+
+    -- Debug logging
+    debug = false,
 }
 
 -- State
 local state = {
-    last_real_time     = tm.os.GetRealtimeSinceStartup(),
-    frametime_ms       = CONFIG.target_frametime_ms,
-    time_behind_ms     = 0,
-    physics_percent    = 100,
-    perf_history       = {},
-    player_just_joined = false,
+    last_real_time          = tm.os.GetRealtimeSinceStartup(),
+    frametime_ms            = CONFIG.target_frametime_ms,
+    time_behind_ms          = 0,
+    physics_percent         = 100,
+    perf_history            = {},
+    player_just_joined      = false,
+    last_cleanup_scan       = 0,
 }
 
--- Only admin (players present at startup) will get the UI
+-- Only players present at mod start get admin UI
 local admin_player_ids = {}
 
 -- Functions
-
 local function log(msg)
     tm.os.Log("[ServerHelper] " .. msg)
 end
 
--- Alert function
 local function send_alert(target, header, message, duration, icon)
     duration = duration or 5
     icon = icon or "servericon"
-    
+
     if target then
-        -- single player
         tm.playerUI.AddSubtleMessageForPlayer(target, header, message, duration, icon)
     else
-        -- broadcast to everyone
         tm.playerUI.AddSubtleMessageForAllPlayers(header, message, duration, icon)
     end
 end
@@ -71,7 +83,11 @@ local function looks_like_build_mode(structure)
     return math.abs(pos.y % 1) < 0.001
 end
 
--- Compatibility with CMM
+local function is_player_in_build_mode(player_id)
+    return tm.players.GetPlayerIsInBuildMode(player_id)
+end
+
+-- CMM compatbility
 local function has_important_blocks(structure)
     local blocks = structure.GetBlocks()
     for _, block in ipairs(blocks) do
@@ -87,21 +103,118 @@ local function has_important_blocks(structure)
     return false
 end
 
---- Returns approximate size
+-- Is a player driving it?
+local function has_seated_player(structure)
+    local blocks = structure.GetBlocks()
+    for _, block in ipairs(blocks) do
+        if block.IsPlayerSeatBlock() and block.Exists() then
+            return true
+        end
+    end
+    return false
+end
+
 local function get_block_count(structure)
     local blocks = structure.GetBlocks()
     return #blocks
-    -- return tm.physics.GetBuildComplexity() or #blocks
 end
 
--- May be broken(!)
+-- May be broken
 local function kick_player_out_of_build_mode(player_id)
     tm.players.SetBuilderEnabled(player_id, false)
     tm.players.SetRepairEnabled(player_id, false)
     log("Kicked player " .. tm.players.GetPlayerName(player_id) .. " out of build mode")
 end
 
--- Cleans up structures
+-- Ambient cleanup and block limits
+local function cleanup_structures_loop()
+    local now = tm.os.GetTime()
+    if now - state.last_cleanup_scan < CONFIG.ambientclean_interval_sec then
+        return 0
+    end
+    state.last_cleanup_scan = now
+
+    local removed = 0
+    local players = tm.players.CurrentPlayers()
+
+    for _, p in ipairs(players) do
+        local player_id = p.playerId
+        local playerName = tm.players.GetPlayerName(player_id)
+
+        if is_player_in_build_mode(player_id) then
+            -- skip this player if in build mode
+        else
+            local structures = tm.players.GetPlayerStructures(player_id)
+
+            for _, structure in ipairs(structures) do
+                local block_count = get_block_count(structure)
+                local in_build_mode = looks_like_build_mode(structure)
+
+                -- Count blocks per type
+                local blocks = structure.GetBlocks()
+                local block_type_counts = {}
+                for _, block in ipairs(blocks) do
+                    if block.Exists() then
+                        local name = block.GetName()
+                        block_type_counts[name] = (block_type_counts[name] or 0) + 1
+                    end
+                end
+
+                -- Block limits
+                local limit_triggered = false
+                local triggered_block = nil
+                local triggered_count = 0
+                local triggered_limit = 0
+
+                for blockName, limit in pairs(CONFIG.block_limits) do
+                    local count = block_type_counts[blockName] or 0
+                    if count >= limit then
+                        limit_triggered = true
+                        triggered_block = blockName
+                        triggered_count = count
+                        triggered_limit = limit
+                        break
+                    end
+                end
+                
+                -- Do stuff if the limit was passed
+                if limit_triggered then
+                    if CONFIG.debug then
+                        log("Removing build from " .. playerName .. ", exceeded " .. triggered_block .. " limit (" .. triggered_count .. "/" .. triggered_limit .. ")")
+                    end
+                    structure.Destroy()
+                    removed = removed + 1
+                    send_alert(player_id,
+                        "Build Removed",
+                        "Exceeded limit of " .. triggered_limit .. " for " .. triggered_block,
+                        6)
+                    --log("Removed build from " .. playerName .. " for exceeding " .. triggered_block .. " limit (" .. triggered_count .. ")")
+
+                    if in_build_mode then
+                        kick_player_out_of_build_mode(player_id)
+                    end
+
+                -- Ambient cleanup of small abandoned debris
+                elseif not in_build_mode
+                    and block_count <= CONFIG.min_ambientclean_amount
+                    and block_count > 0
+                    and not has_seated_player(structure)
+                    and not has_important_blocks(structure) then
+
+                    if CONFIG.debug then
+                        log("Ambient cleanup triggered on " .. block_count .. " block debris from " .. playerName)
+                    end
+                    structure.Destroy()
+                    removed = removed + 1
+                end
+            end
+        end
+    end
+
+    return removed
+end
+
+-- Clean everything (admin button)
 local function cleanup_all_structures()
     local count = 0
     local players = tm.players.CurrentPlayers()
@@ -115,28 +228,38 @@ local function cleanup_all_structures()
     end
 
     if count > 0 then
-        send_alert(nil, "Cleanup", "Removed " .. count .. " structures", 5)
-        log("Cleanup removed " .. count .. " structures")
+        send_alert(nil, "Admin Cleanup", "Removed " .. count .. " structures", 5)
+        log("Admin cleanup removed " .. count .. " structures")
     end
     return count
 end
 
--- Structures a player isnt driving
+-- Clean structures that arent being drived
 local function cleanup_unused_structures()
     local count = 0
     local players = tm.players.CurrentPlayers()
 
     for _, p in ipairs(players) do
-        local structures = tm.players.GetPlayerStructures(p.playerId)
-        for _, structure in ipairs(structures) do
-            if looks_like_build_mode(structure) then
-                -- skip build mode in normal cleanup
-            elseif has_important_blocks(structure) then
-                -- skip protected builds
-            else
-                structure.Dispose()
-                count = count + 1
-                log("Disposed unused structure owned by " .. tm.players.GetPlayerName(p.playerId))
+        local player_id = p.playerId
+        local playerName = tm.players.GetPlayerName(player_id)
+
+        if is_player_in_build_mode(player_id) then
+            -- skip
+        else
+            local structures = tm.players.GetPlayerStructures(player_id)
+            for _, structure in ipairs(structures) do
+                if looks_like_build_mode(structure) then
+                    -- skip build mode shapes
+                elseif has_important_blocks(structure) then
+                    -- skip protected builds
+                else
+                    if CONFIG.debug then
+                        log("Disposed unused structure owned by " .. playerName)
+                    end
+                    --structure.Destroy()
+                    structure.Dispose()
+                    count = count + 1            
+                end
             end
         end
     end
@@ -148,7 +271,7 @@ local function cleanup_unused_structures()
     return count > 0
 end
 
---- Critical performance 
+-- Big lag so remove everything large unfinished builds
 local function emergency_cleanup_large_builds()
     local count = 0
     local players = tm.players.CurrentPlayers()
@@ -156,29 +279,37 @@ local function emergency_cleanup_large_builds()
     for _, p in ipairs(players) do
         local player_id = p.playerId
         local playerName = tm.players.GetPlayerName(player_id)
-        local structures = tm.players.GetPlayerStructures(player_id)
 
-        for _, structure in ipairs(structures) do
-            if looks_like_build_mode(structure)
-               and not has_important_blocks(structure)
-               and get_block_count(structure) >= CONFIG.critical_build_cleanup_blocks then
+        if is_player_in_build_mode(player_id) then
+            -- skip
+        else
+            local structures = tm.players.GetPlayerStructures(player_id)
 
-                local size = get_block_count(structure)
-                structure.Dispose()
-                count = count + 1
-                log(string.format(
-                    "CRITICAL destroyed large build-mode creations (%d blocks) by %s",
-                    size, playerName
-                ))
-                
-                -- Kick player out of build mode after deleting their build
-                kick_player_out_of_build_mode(player_id)
+            for _, structure in ipairs(structures) do
+                if looks_like_build_mode(structure)
+                   and not has_important_blocks(structure)
+                   and get_block_count(structure) >= CONFIG.critical_build_cleanup_blocks then
+
+                    local size = get_block_count(structure)
+
+                    if CONFIG.debug then
+                        log(string.format(
+                        "CRITICAL destroyed large build-mode creation (%d blocks) by %s",
+                        size, playerName
+                        ))
+                    end
+                    --structure.Destroy()
+                    structure.Dispose()
+                    count = count + 1
+                    
+                    kick_player_out_of_build_mode(player_id)
+                end
             end
         end
     end
 
     if count > 0 then
-        send_alert(nil, "CRITICAL Lag Protection", "Removed " .. count .. " very large unfinished builds", 6)
+        send_alert(nil, "CRITICAL Lag Protection", "Removed " .. count .. " builds", 6)
     end
 
     return count
@@ -187,16 +318,16 @@ end
 -- Init
 tm.os.SetModTargetDeltaTime(1/60)
 tm.physics.AddTexture("server.png", "servericon")
-log("Server helper started, target: " .. CONFIG.target_fps .. " fps")
+log("Server helper started, target: " .. CONFIG.target_fps .. " fps, debug logging: " .. tostring(CONFIG.debug))
 
--- Capture players who are already connected when the mod starts (usually just admin/host)
+-- Determine the host
 local initial_players = tm.players.CurrentPlayers()
 for _, p in ipairs(initial_players) do
     table.insert(admin_player_ids, p.playerId)
-    log("Admin player detected at startup: " .. tm.players.GetPlayerName(p.playerId) .. " (id " .. p.playerId .. ")")
+    log("Admin detected at startup: " .. tm.players.GetPlayerName(p.playerId) .. " (id " .. p.playerId .. ")")
 end
 
--- Events
+-- Player join and UI stuff
 local function on_player_joined(callback)
     local player_id = callback.playerId
     local name = tm.players.GetPlayerName(player_id)
@@ -204,7 +335,6 @@ local function on_player_joined(callback)
 
     state.player_just_joined = true
 
-    -- Only show UI to admin players (those present at mod init)
     local is_admin = false
     for _, admin_id in ipairs(admin_player_ids) do
         if admin_id == player_id then
@@ -213,9 +343,7 @@ local function on_player_joined(callback)
         end
     end
 
-    if not is_admin then
-        return  -- no UI for late joiners
-    end
+    if not is_admin then return end
 
     local function label(id, text)
         tm.playerUI.AddUILabel(player_id, id, text)
@@ -232,14 +360,15 @@ local function on_player_joined(callback)
     label("physspeed",    "100% physics")
     label("spacer2",      "")
 
-    tm.playerUI.AddUIButton(player_id, "cleanall", "Clean ALL Builds", function()
-        cleanup_all_structures()
-    end, nil)
+    -- Main cleanup buttons
+    tm.playerUI.AddUIButton(player_id, "cleanall",       "Clean ALL Builds",       function() cleanup_all_structures()       end, nil)
+    tm.playerUI.AddUIButton(player_id, "clean_critical", "Trigger Critical Cleanup", function() emergency_cleanup_large_builds() end, nil)
+    tm.playerUI.AddUIButton(player_id, "clean_lowperf",  "Trigger Low-Perf Cleanup", function() cleanup_unused_structures()       end, nil)
 end
 
 tm.players.OnPlayerJoined.add(on_player_joined)
 
--- Main update loop
+-- Main update
 function update()
     tm.os.SetModTargetDeltaTime(1/60)
 
@@ -259,25 +388,28 @@ function update()
 
     local avg_fps = get_average_fps()
 
-    -- Decide actions
+    -- Do the cleanup loop
+    cleanup_structures_loop()
+
+    -- FPS based stuff
     local did_cleanup = false
 
     if current_fps <= CONFIG.critical_fps and avg_fps <= CONFIG.critical_avg_fps then
         log(string.format("CRITICAL LAG  %.1f fps (avg %.1f)", current_fps, avg_fps))
 
         local total_removed = cleanup_all_structures()
-        local large_builds_removed = emergency_cleanup_large_builds()
+        local large_removed = emergency_cleanup_large_builds()
 
-        did_cleanup = (total_removed + large_builds_removed > 0)
+        did_cleanup = (total_removed + large_removed > 0)
 
     elseif current_fps <= CONFIG.cleanup_at_fps and avg_fps <= CONFIG.cleanup_at_avg_fps then
         if not state.player_just_joined then
-            log(string.format("Low perf  %.1f fps (avg %.1f) cleaning unused", current_fps, avg_fps))
+            log(string.format("Low perf  %.1f fps (avg %.1f), cleaning", current_fps, avg_fps))
             did_cleanup = cleanup_unused_structures()
         end
     end
 
-    -- Adjust physics timescale
+    -- Physics timescale smoothing
     local target_scale = 1.0
 
     if current_fps <= CONFIG.slow_physics_at_fps and avg_fps <= CONFIG.slow_physics_at_fps + 5 then
@@ -298,9 +430,8 @@ function update()
 
     state.player_just_joined = false
 
-    -- Update UI only for admin players
+    -- Update admin UI
     for _, pid in ipairs(admin_player_ids) do
-        -- Only update if the player still exists
         local player_exists = false
         local current_players = tm.players.CurrentPlayers()
         for _, p in ipairs(current_players) do
