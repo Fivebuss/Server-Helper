@@ -287,18 +287,17 @@ local function emergency_cleanup_large_builds()
 
             for _, structure in ipairs(structures) do
                 if looks_like_build_mode(structure)
-                   and not has_important_blocks(structure)
+                   --and not has_important_blocks(structure)
                    and get_block_count(structure) >= CONFIG.critical_build_cleanup_blocks then
 
                     local size = get_block_count(structure)
 
-                    if CONFIG.debug then
-                        log(string.format(
+                    log(string.format(
                         "CRITICAL destroyed large build-mode creation (%d blocks) by %s",
                         size, playerName
                         ))
-                    end
                     --structure.Destroy()
+
                     structure.Dispose()
                     count = count + 1
                     
@@ -309,7 +308,7 @@ local function emergency_cleanup_large_builds()
     end
 
     if count > 0 then
-        send_alert(nil, "CRITICAL Lag Protection", "Removed " .. count .. " builds", 6)
+        send_alert(nil, "Horrendous lag: ", "Removed " .. count .. " builds", 6)
     end
 
     return count
@@ -362,7 +361,6 @@ local function on_player_joined(callback)
 
     -- Main cleanup buttons
     tm.playerUI.AddUIButton(player_id, "cleanall",       "Clean ALL Builds",       function() cleanup_all_structures()       end, nil)
-    tm.playerUI.AddUIButton(player_id, "clean_critical", "Trigger Critical Cleanup", function() emergency_cleanup_large_builds() end, nil)
     tm.playerUI.AddUIButton(player_id, "clean_lowperf",  "Trigger Low-Perf Cleanup", function() cleanup_unused_structures()       end, nil)
 end
 
