@@ -1,23 +1,23 @@
 -- An attempt at making the MP experience bearable for once
 -- Server performance & stability helper
+-- Anticrash is a bit broken
 
 -- Configuration
 local CONFIG = {
-    target_frametime_ms    = 16.666,     -- 60 fps
+    target_frametime_ms    = 16.666,     -- 60 fps, 1000/X = ms 
     target_fps             = 60,
 
     warn_at_fps            = 45,
     slow_physics_at_fps    = 38,
     slow_physics_minimum   = 0.20,
 
+    -- Cleans up all builds
     critical_fps           = 10,
     critical_avg_fps       = 12,
 
+    -- Cleans up unused builds
     cleanup_at_fps         = 42,
     cleanup_at_avg_fps     = 42,
-
-    -- Critical cleanup
-    critical_build_cleanup_blocks = 200,
 
     physics_recovery_step  = 0.04,
 
@@ -27,12 +27,38 @@ local CONFIG = {
     min_ambientclean_amount     = 25,       -- How big is a small debris?
     ambientclean_interval_sec   = 5.0,      -- how often to scan
 
-    -- block limits, use the internal name, good luck on that
+    -- Missiles and such, can be expensive though to calculate velocity 
+    velocity_enable        = true,
+    velocity_min           = 15.0,          -- m/s - minimum speed to be considered "active" to withstand low-perf clean
+
+    -- Whitelist from ambient clean, use the internal name good luck on that
+    whitelist = {
+        "PFB_AnchorBlock",
+        "PFB_MixelEye_Sphere",
+
+        "PFB_InputSeat",
+        "PFB_DistanceSensorBlock",
+        "PFB_DisplayLogicBlock",
+        "PFB_SpeedSensorBlock",
+        "PFB_AltitudeSensorBlock",
+        "PFB_AccumulatorLogicBlock",
+        "PFB_ArithmeticLogicBlock",
+        "PFB_Piston",
+        "PFB_ComparisonLogicBlock",
+        "PFB_NotLogicBlock",
+        "PFB_XORLogicBlock",
+        "PFB_OrLogicBlock",
+        "PFB_RNGLogicBlock",
+        "PFB_FunctionsLogicBlock",
+        "PFB_AndLogicBlock",
+        "PFB_AggregateLogicBlock",
+        -- etc
+    },
+
+    -- Block limits, also use the internal name
     block_limits = {
         PFB_BombRack = 5
-        -- PFB_RocketPod = 4,
-        -- PFB_FlakCannon = 3,
-        -- etc...
+        -- etc
     },
 
     -- Debug logging
@@ -87,16 +113,23 @@ local function is_player_in_build_mode(player_id)
     return tm.players.GetPlayerIsInBuildMode(player_id)
 end
 
--- CMM compatbility
-local function has_important_blocks(structure)
+-- Checks whitelist
+local function has_whitelisted_block(structure)
     local blocks = structure.GetBlocks()
     for _, block in ipairs(blocks) do
         if block.Exists() then
-            local name = block.GetName()
-            if block.IsPlayerSeatBlock()
-                or name == "PFB_AnchorBlock"
-                or name == "PFB_MixelEye_Sphere" then
-                return true
+            local name = block.GetName() or ""
+            -- WHY TM DO YOU PREPEND [Server] TO BLOCKS DISCONNECTED
+            name = string.gsub(name, " %[Server%]$", "")
+            name = string.match(name, "^%s*(.-)%s*$") or name
+
+            for _, wl_name in ipairs(CONFIG.whitelist) do
+                if name == wl_name then
+                    if CONFIG.debug then
+                        log("Whitelist match: " .. name .. " (original: " .. block.GetName() .. ")")
+                    end
+                    return true
+                end
             end
         end
     end
@@ -119,11 +152,75 @@ local function get_block_count(structure)
     return #blocks
 end
 
--- May be broken
-local function kick_player_out_of_build_mode(player_id)
-    tm.players.SetBuilderEnabled(player_id, false)
-    tm.players.SetRepairEnabled(player_id, false)
-    log("Kicked player " .. tm.players.GetPlayerName(player_id) .. " out of build mode")
+-- If its more than velocity_min
+local function is_moving_fast_enough(structure)
+    if not CONFIG.velocity_enable then
+        return false
+    end
+    local vel = structure.GetVelocity()
+    local speed = math.sqrt(vel.x*vel.x + vel.y*vel.y + vel.z*vel.z)
+    return speed >= CONFIG.velocity_min
+end
+
+-- Build info
+local function dump_all_build_info()
+    log("[BUILD DUMP -|")
+    
+    local players = tm.players.CurrentPlayers()
+    local total_structures = 0
+    local total_blocks = 0
+    
+    for _, p in ipairs(players) do
+        local player_id = p.playerId
+        local player_name = tm.players.GetPlayerName(player_id)
+        local structures = tm.players.GetPlayerStructures(player_id)
+        
+        if #structures > 0 then
+            log("Player: " .. player_name .. " (ID " .. player_id .. ") - " .. #structures .. " structures")
+            
+            for i, structure in ipairs(structures) do
+                total_structures = total_structures + 1
+                
+                local block_count = get_block_count(structure)
+                total_blocks = total_blocks + block_count
+                
+                local vel = structure.GetVelocity()
+                local speed = math.sqrt(vel.x*vel.x + vel.y*vel.y + vel.z*vel.z)
+                
+                log(string.format(
+                    "  [%d] Blocks: %d | Velocity: %.2f m/s (%.2f, %.2f, %.2f)",
+                    i, block_count, speed, vel.x, vel.y, vel.z
+                ))
+                
+                -- Block type breakdown
+                local block_counts = {}
+                local blocks = structure.GetBlocks()
+                for _, block in ipairs(blocks) do
+                    if block.Exists() then
+                        local name = block.GetName()
+                        block_counts[name] = (block_counts[name] or 0) + 1
+                    end
+                end
+                
+                if next(block_counts) then
+                    log("    Block breakdown:")
+                    for name, count in pairs(block_counts) do
+                        log("      " .. name .. ": " .. count)
+                    end
+                else
+                    log("    No blocks found (invalid)")
+                end
+            end
+        end
+    end
+    
+    log(string.format(
+        "Total: %d structures | %d blocks across all players",
+        total_structures, total_blocks
+    ))
+    log("|- BUILD DUMP]")
+    
+    send_alert(nil, "Build Dump", "Structure info to server log", 4)
 end
 
 -- Ambient cleanup and block limits
@@ -188,18 +285,14 @@ local function cleanup_structures_loop()
                         "Build Removed",
                         "Exceeded limit of " .. triggered_limit .. " for " .. triggered_block,
                         6)
-                    --log("Removed build from " .. playerName .. " for exceeding " .. triggered_block .. " limit (" .. triggered_count .. ")")
-
-                    if in_build_mode then
-                        kick_player_out_of_build_mode(player_id)
-                    end
 
                 -- Ambient cleanup of small abandoned debris
                 elseif not in_build_mode
                     and block_count <= CONFIG.min_ambientclean_amount
                     and block_count > 0
                     and not has_seated_player(structure)
-                    and not has_important_blocks(structure) then
+                    and not has_whitelisted_block(structure)
+                    and not is_moving_fast_enough(structure) then
 
                     if CONFIG.debug then
                         log("Ambient cleanup triggered on " .. block_count .. " block debris from " .. playerName)
@@ -248,15 +341,14 @@ local function cleanup_unused_structures()
         else
             local structures = tm.players.GetPlayerStructures(player_id)
             for _, structure in ipairs(structures) do
+                local block_count = get_block_count(structure)
+                -- If hell
                 if looks_like_build_mode(structure) then
-                    -- skip build mode shapes
-                elseif has_important_blocks(structure) then
-                    -- skip protected builds
-                else
+                elseif has_seated_player(structure) then
+                elseif not has_whitelisted_block(structure) then
                     if CONFIG.debug then
-                        log("Disposed unused structure owned by " .. playerName)
+                        log("Disposed unused structure owned by " .. playerName .. " (" .. block_count .. " blocks)")
                     end
-                    --structure.Destroy()
                     structure.Dispose()
                     count = count + 1            
                 end
@@ -265,13 +357,15 @@ local function cleanup_unused_structures()
     end
 
     if count > 0 then
-        send_alert(nil, "Low Performance Cleanup", "Removed " .. count .. " unused structures", 4)
+        if CONFIG.debug then
+            send_alert(nil, "Low Performance Cleanup", "Removed " .. count .. " unused structures", 4)
+        end
     end
 
     return count > 0
 end
 
--- Big lag so remove everything large unfinished builds
+-- Big lag so remove everything
 local function emergency_cleanup_large_builds()
     local count = 0
     local players = tm.players.CurrentPlayers()
@@ -286,22 +380,16 @@ local function emergency_cleanup_large_builds()
             local structures = tm.players.GetPlayerStructures(player_id)
 
             for _, structure in ipairs(structures) do
-                if looks_like_build_mode(structure)
-                   --and not has_important_blocks(structure)
-                   and get_block_count(structure) >= CONFIG.critical_build_cleanup_blocks then
+                if looks_like_build_mode(structure) then
 
                     local size = get_block_count(structure)
 
                     log(string.format(
-                        "CRITICAL destroyed large build-mode creation (%d blocks) by %s",
+                        "CRITICAL destroyed (%d blocks) by %s",
                         size, playerName
                         ))
-                    --structure.Destroy()
-
                     structure.Dispose()
                     count = count + 1
-                    
-                    kick_player_out_of_build_mode(player_id)
                 end
             end
         end
@@ -317,7 +405,7 @@ end
 -- Init
 tm.os.SetModTargetDeltaTime(1/60)
 tm.physics.AddTexture("server.png", "servericon")
-log("Server helper started, target: " .. CONFIG.target_fps .. " fps, debug logging: " .. tostring(CONFIG.debug))
+log("Server helper started, target: " .. CONFIG.target_fps .. " fps, debug: " .. tostring(CONFIG.debug))
 
 -- Determine the host
 local initial_players = tm.players.CurrentPlayers()
@@ -359,9 +447,10 @@ local function on_player_joined(callback)
     label("physspeed",    "100% physics")
     label("spacer2",      "")
 
-    -- Main cleanup buttons
-    tm.playerUI.AddUIButton(player_id, "cleanall",       "Clean ALL Builds",       function() cleanup_all_structures()       end, nil)
-    tm.playerUI.AddUIButton(player_id, "clean_lowperf",  "Trigger Low-Perf Cleanup", function() cleanup_unused_structures()       end, nil)
+    -- Main buttons
+    tm.playerUI.AddUIButton(player_id, "cleanall",       "Clean ALL Builds",            function() cleanup_all_structures()    end, nil)
+    tm.playerUI.AddUIButton(player_id, "clean_lowperf",  "Trigger Low-Perf Cleanup",   function() cleanup_unused_structures() end, nil)
+    tm.playerUI.AddUIButton(player_id, "dump_builds",    "Dump Build Info",            function() dump_all_build_info()       end, nil)
 end
 
 tm.players.OnPlayerJoined.add(on_player_joined)
@@ -401,8 +490,8 @@ function update()
         did_cleanup = (total_removed + large_removed > 0)
 
     elseif current_fps <= CONFIG.cleanup_at_fps and avg_fps <= CONFIG.cleanup_at_avg_fps then
-        if not state.player_just_joined then
-            log(string.format("Low perf  %.1f fps (avg %.1f), cleaning", current_fps, avg_fps))
+        if not state.player_just_joined and CONFIG.debug then
+            log(string.format("Lag detected %.1f fps (avg %.1f) ", current_fps, avg_fps))
             did_cleanup = cleanup_unused_structures()
         end
     end
@@ -417,6 +506,7 @@ function update()
 
     local current_scale = tm.physics.GetTimeScale()
 
+    -- Time step
     if target_scale < current_scale then
         tm.physics.SetTimeScale(target_scale)
         state.physics_percent = math.floor(target_scale * 100)
