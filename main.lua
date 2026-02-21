@@ -31,7 +31,11 @@ local CONFIG = {
     velocity_enable        = true,
     velocity_min           = 15.0,          -- m/s - minimum speed to be considered "active" to withstand low-perf clean
 
+    -- Whitelist toggle
+    whitelist_enabled      = true,
+
     -- Whitelist from ambient clean, use the internal name good luck on that
+    -- By default some common blocks used in missiles and such are included
     whitelist = {
         "PFB_AnchorBlock",
         "PFB_MixelEye_Sphere",
@@ -52,12 +56,6 @@ local CONFIG = {
         "PFB_FunctionsLogicBlock",
         "PFB_AndLogicBlock",
         "PFB_AggregateLogicBlock",
-        -- etc
-    },
-
-    -- Block limits, also use the internal name
-    block_limits = {
-        PFB_BombRack = 5
         -- etc
     },
 
@@ -115,6 +113,10 @@ end
 
 -- Checks whitelist
 local function has_whitelisted_block(structure)
+    if not CONFIG.whitelist_enabled then
+        return false
+    end
+
     local blocks = structure.GetBlocks()
     for _, block in ipairs(blocks) do
         if block.Exists() then
@@ -223,7 +225,7 @@ local function dump_all_build_info()
     send_alert(nil, "Build Dump", "Structure info to server log", 4)
 end
 
--- Ambient cleanup and block limits
+-- Ambient cleanup
 local function cleanup_structures_loop()
     local now = tm.os.GetTime()
     if now - state.last_cleanup_scan < CONFIG.ambientclean_interval_sec then
@@ -247,47 +249,8 @@ local function cleanup_structures_loop()
                 local block_count = get_block_count(structure)
                 local in_build_mode = looks_like_build_mode(structure)
 
-                -- Count blocks per type
-                local blocks = structure.GetBlocks()
-                local block_type_counts = {}
-                for _, block in ipairs(blocks) do
-                    if block.Exists() then
-                        local name = block.GetName()
-                        block_type_counts[name] = (block_type_counts[name] or 0) + 1
-                    end
-                end
-
-                -- Block limits
-                local limit_triggered = false
-                local triggered_block = nil
-                local triggered_count = 0
-                local triggered_limit = 0
-
-                for blockName, limit in pairs(CONFIG.block_limits) do
-                    local count = block_type_counts[blockName] or 0
-                    if count >= limit then
-                        limit_triggered = true
-                        triggered_block = blockName
-                        triggered_count = count
-                        triggered_limit = limit
-                        break
-                    end
-                end
-                
-                -- Do stuff if the limit was passed
-                if limit_triggered then
-                    if CONFIG.debug then
-                        log("Removing build from " .. playerName .. ", exceeded " .. triggered_block .. " limit (" .. triggered_count .. "/" .. triggered_limit .. ")")
-                    end
-                    structure.Destroy()
-                    removed = removed + 1
-                    send_alert(player_id,
-                        "Build Removed",
-                        "Exceeded limit of " .. triggered_limit .. " for " .. triggered_block,
-                        6)
-
                 -- Ambient cleanup of small abandoned debris
-                elseif not in_build_mode
+                if not in_build_mode
                     and block_count <= CONFIG.min_ambientclean_amount
                     and block_count > 0
                     and not has_seated_player(structure)
@@ -313,10 +276,16 @@ local function cleanup_all_structures()
     local players = tm.players.CurrentPlayers()
 
     for _, p in ipairs(players) do
-        local structures = tm.players.GetPlayerStructures(p.playerId)
-        for _, structure in ipairs(structures) do
-            structure.Dispose()
-            count = count + 1
+        local player_id = p.playerId
+
+        if is_player_in_build_mode(player_id) then
+            -- skip
+        else
+            local structures = tm.players.GetPlayerStructures(player_id)
+            for _, structure in ipairs(structures) do
+                structure.Dispose()
+                count = count + 1
+            end
         end
     end
 
