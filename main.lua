@@ -42,13 +42,8 @@ local CONFIG = {
 
         "PFB_InputSeat",
         "PFB_DistanceSensorBlock",
-        "PFB_DisplayLogicBlock",
         "PFB_SpeedSensorBlock",
         "PFB_AltitudeSensorBlock",
-        "PFB_AccumulatorLogicBlock",
-        "PFB_ArithmeticLogicBlock",
-        "PFB_Piston",
-        "PFB_ComparisonLogicBlock",
         "PFB_NotLogicBlock",
         "PFB_XORLogicBlock",
         "PFB_OrLogicBlock",
@@ -112,11 +107,7 @@ local function is_player_in_build_mode(player_id)
 end
 
 -- Checks whitelist
-local function has_whitelisted_block(structure)
-    if not CONFIG.whitelist_enabled then
-        return false
-    end
-
+local function has_whitelisted_block_or_inputseat(structure)
     local blocks = structure.GetBlocks()
     for _, block in ipairs(blocks) do
         if block.Exists() then
@@ -125,12 +116,23 @@ local function has_whitelisted_block(structure)
             name = string.gsub(name, " %[Server%]$", "")
             name = string.match(name, "^%s*(.-)%s*$") or name
 
-            for _, wl_name in ipairs(CONFIG.whitelist) do
-                if name == wl_name then
-                    if CONFIG.debug then
-                        log("Whitelist match: " .. name .. " (original: " .. block.GetName() .. ")")
+            -- Seat is always checked, you know so it works
+            if name == "PFB_InputSeat" then
+                if CONFIG.debug then
+                    log("Protected: InputSeat found")
+                end
+                return true
+            end
+
+            -- Check
+            if CONFIG.whitelist_enabled then
+                for _, wl_name in ipairs(CONFIG.whitelist) do
+                    if name == wl_name then
+                        if CONFIG.debug then
+                            log("Whitelist match: " .. name .. " (original: " .. block.GetName() .. ")")
+                        end
+                        return true
                     end
-                    return true
                 end
             end
         end
@@ -254,7 +256,7 @@ local function cleanup_structures_loop()
                     and block_count <= CONFIG.min_ambientclean_amount
                     and block_count > 0
                     and not has_seated_player(structure)
-                    and not has_whitelisted_block(structure)
+                    and not has_whitelisted_block_or_inputseat(structure)
                     and not is_moving_fast_enough(structure) then
 
                     if CONFIG.debug then
@@ -314,10 +316,8 @@ local function cleanup_unused_structures()
                 -- If hell
                 if looks_like_build_mode(structure) then
                 elseif has_seated_player(structure) then
-                elseif not has_whitelisted_block(structure) then
-                    if CONFIG.debug then
-                        log("Disposed unused structure owned by " .. playerName .. " (" .. block_count .. " blocks)")
-                    end
+                elseif not has_whitelisted_block_or_inputseat(structure) then
+                    log("Low-perf cleanup disposed unused structure owned by " .. playerName .. " (" .. block_count .. " blocks)")
                     structure.Dispose()
                     count = count + 1            
                 end
@@ -326,9 +326,7 @@ local function cleanup_unused_structures()
     end
 
     if count > 0 then
-        if CONFIG.debug then
-            send_alert(nil, "Low Performance Cleanup", "Removed " .. count .. " unused structures", 4)
-        end
+        send_alert(nil, "Low Performance Cleanup", "Removed " .. count .. " structures", 4)
     end
 
     return count > 0
@@ -337,6 +335,8 @@ end
 -- Big lag so remove everything
 local function emergency_cleanup_large_builds()
     local count = 0
+    local removed_info = {}
+
     local players = tm.players.CurrentPlayers()
 
     for _, p in ipairs(players) do
@@ -353,10 +353,11 @@ local function emergency_cleanup_large_builds()
 
                     local size = get_block_count(structure)
 
-                    log(string.format(
-                        "CRITICAL destroyed (%d blocks) by %s",
+                    table.insert(removed_info, string.format(
+                        "%d blocks from %s",
                         size, playerName
-                        ))
+                    ))
+
                     structure.Dispose()
                     count = count + 1
                 end
@@ -365,7 +366,12 @@ local function emergency_cleanup_large_builds()
     end
 
     if count > 0 then
-        send_alert(nil, "Horrendous lag: ", "Removed " .. count .. " builds", 6)
+        log("CRITICAL LAG cleanup removed " .. count .. " structures:")
+        for _, line in ipairs(removed_info) do
+            log("  - " .. line)
+        end
+        
+        send_alert(nil, "Horrendous lag: ", "Removed " .. count .. " structures", 6)
     end
 
     return count
@@ -459,8 +465,8 @@ function update()
         did_cleanup = (total_removed + large_removed > 0)
 
     elseif current_fps <= CONFIG.cleanup_at_fps and avg_fps <= CONFIG.cleanup_at_avg_fps then
-        if not state.player_just_joined and CONFIG.debug then
-            log(string.format("Lag detected %.1f fps (avg %.1f) ", current_fps, avg_fps))
+        if not state.player_just_joined then
+            log(string.format("Lag detected %.1f fps (avg %.1f) → running low-perf cleanup", current_fps, avg_fps))
             did_cleanup = cleanup_unused_structures()
         end
     end
